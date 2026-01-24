@@ -262,7 +262,3 @@ if __name__ == "__main__":
 
     else:
         raise NotImplementedError(f"Unknown mode {args.mode}")
-
-
-
-
