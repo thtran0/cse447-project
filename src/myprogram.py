@@ -11,8 +11,7 @@ MODEL_FNAME = "model.pkl"
 
 MAX_ORDER = 6
 TOP_K     = 25
-WEIGHTS   = [0.02, 0.05, 0.10, 0.18, 0.28, 0.37]  # interpolation weights
-
+WEIGHTS = [0.20, 0.20, 0.18, 0.16, 0.14, 0.12]
 def _safe_read_text(path: str) -> str:
     """Read UTF-8 text robustly (ignore decode errors)."""
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -133,7 +132,7 @@ class MyModel:
 
         for i in range(n - 1):
             nxt = text[i + 1]
-
+            counters[0][""][nxt] += 1
             for order in range(MAX_ORDER):
                 # order=0: unigram (context="")
                 # order=1: bigram (context=last 1 char)
