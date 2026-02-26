@@ -1,12 +1,17 @@
 #!/usr/bin/env python
 import os
-import string
-import random
-import json
+import pickle
+# import json
+import math
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from collections import Counter, defaultdict
 
-MODEL_FNAME = "model.json"
+# MODEL_FNAME = "model.json"
+MODEL_FNAME = "model.pkl"
+
+MAX_ORDER = 6
+TOP_K     = 25
+WEIGHTS   = [0.02, 0.05, 0.10, 0.18, 0.28, 0.37]  # interpolation weights
 
 def _safe_read_text(path: str) -> str:
     """Read UTF-8 text robustly (ignore decode errors)."""
@@ -30,6 +35,11 @@ def _find_training_files() -> list[str]:
         for fn in os.listdir("data"):
             if fn.endswith(".txt") or fn.endswith(".tokens"):
                 candidates.append(os.path.join("data", fn))
+
+    if os.path.isdir("src/data"):
+        for fn in sorted(os.listdir("src/data")):
+            if fn.endswith((".txt", ".tokens", ".text")):
+                candidates.append(os.path.join("src/data", fn))
 
     # If you're running inside docker with mounted /job/data
     if os.path.isdir("/job/data"):
@@ -61,13 +71,9 @@ class MyModel:
     """
 
     def __init__(self):
-        # Precomputed top-3 guesses for each context for fast prediction
-        self.top3_uni: list[str] = []
-        self.top3_bi: dict[str, list[str]] = {}   # context: 1 char -> list[str] length 3
-        self.top3_tri: dict[str, list[str]] = {}  # context: 2 chars -> list[str] length 3
-
-        # Default fallback guesses
-        self.default_top3: list[str] = [" ", "e", "a"]
+        self.maps: list = [{} for _ in range(MAX_ORDER)]
+        self.default_top3: list = [" ", "e", "t"]
+        self.unigram_dist: dict = {}
 
 
     @classmethod
@@ -104,52 +110,57 @@ class MyModel:
         Train n-gram counts from training texts and precompute top-3 maps.
         data: list[str]
         """
-        text = "\n".join(data)
 
-        # If dataset is empty, keep defaults
-        if not text:
-            self.top3_uni = self.default_top3[:]
-            self.top3_bi = {}
-            self.top3_tri = {}
+        text = " ".join(data)
+
+        if not text.strip():
             return
+        
+        unigram_counter = Counter(text)
+        total_chars = sum(unigram_counter.values())
+        self.unigram_dist = {
+            c: cnt / total_chars
+            for c, cnt in unigram_counter.items()
+        }
+        self.default_top3 = [c for c, _ in unigram_counter.most_common(3)]
 
-        # Count unigrams, bigrams, trigrams over characters
-        uni = Counter()
-        bi = defaultdict(Counter)   # prev_char -> Counter(next_char)
-        tri = defaultdict(Counter)  # prev2 (len 2) -> Counter(next_char)
+        print(f"Training on {len(text):,} characters, max order={MAX_ORDER}")
 
-        for ch in text:
-            uni[ch] += 1
+        # one counter per order instead of uni/bi/tri
+        counters = [defaultdict(Counter) for _ in range(MAX_ORDER)]
 
-        for i in range(len(text) - 1):
-            c1 = text[i]
-            c2 = text[i + 1]
-            bi[c1][c2] += 1
+        n = len(text)
 
-        for i in range(len(text) - 2):
-            ctx = text[i : i + 2]
-            nxt = text[i + 2]
-            tri[ctx][nxt] += 1
+        for i in range(n - 1):
+            nxt = text[i + 1]
 
-        def best3(counter: Counter) -> list[str]:
-            if not counter:
-                return []
-            chars = [c for (c, _) in counter.most_common(3)]
-            while len(chars) < 3:
-                chars.append(self.default_top3[len(chars)])
-            return chars[:3]
+            for order in range(MAX_ORDER):
+                # order=0: unigram (context="")
+                # order=1: bigram (context=last 1 char)
+                # ...
+                start = i - order + 1
+                if start < 0:
+                    continue
 
-        self.top3_uni = best3(uni)
-        if len(self.top3_uni) < 3:
-            self.top3_uni = (self.top3_uni + self.default_top3)[:3]
+                ctx = text[start : i + 1]
+                counters[order][ctx][nxt] += 1
 
-        self.top3_bi = {}
-        for c1, ctr in bi.items():
-            self.top3_bi[c1] = best3(ctr)
+        # store top-K instead of top-3
+        for order in range(MAX_ORDER):
+            self.maps[order] = {}
 
-        self.top3_tri = {}
-        for ctx, ctr in tri.items():
-            self.top3_tri[ctx] = best3(ctr)
+            for ctx, ctr in counters[order].items():
+                top = ctr.most_common(TOP_K)
+                total = sum(ctr.values())
+
+                # store normalized probabilities
+                self.maps[order][ctx] = {
+                    c: cnt / total
+                    for c, cnt in top
+                }
+
+        print("done")
+
 
  
     def run_pred(self, data: list[str]) -> list[str]:
@@ -157,62 +168,101 @@ class MyModel:
         data: list[str] where each string is a prefix.
         Return list[str] where each element is exactly 3 characters (guesses).
         """
-        preds: list[str] = []
-
-        uni_fallback = self.top3_uni if self.top3_uni else self.default_top3
+        preds = []
 
         for inp in data:
-            guesses = None
-
             try:
-                if len(inp) >= 2:
-                    ctx2 = inp[-2:]
-                    guesses = self.top3_tri.get(ctx2)
-
-                if guesses is None and len(inp) >= 1:
-                    ctx1 = inp[-1]
-                    guesses = self.top3_bi.get(ctx1)
-
-                if guesses is None:
-                    guesses = uni_fallback
-
+                preds.append(self._predict_one(inp))
             except Exception:
-                guesses = self.default_top3
-
-            guesses = (guesses + self.default_top3)[:3]
-            preds.append("".join(guesses))
+                preds.append("".join(self.default_top3[:3]))
 
         return preds
+    
+    def _predict_one(self, inp: str) -> str:
+        scores = {}
+        available = []
+
+        for order in range(MAX_ORDER):
+
+            if order == 0:
+                ctx = ""
+            else:
+                if len(inp) < order:
+                    continue
+                ctx = inp[-order:]
+
+            candidates = self.maps[order].get(ctx)
+
+            if candidates:
+                available.append((order, candidates))
+
+        if not available:
+            if self.unigram_dist:
+                top3 = sorted(self.unigram_dist.items(),
+                            key=lambda x: x[1],
+                            reverse=True)[:3]
+                return "".join(c for c, _ in top3)
+
+            return "".join(self.default_top3[:3])
+
+        total_weight = sum(WEIGHTS[o] for o, _ in available)
+
+        for order, candidates in available:
+            weight = WEIGHTS[order] / total_weight
+
+            for ch, prob in candidates.items():
+                scores[ch] = scores.get(ch, 0.0) + weight * prob
+
+        unigram_weight = 0.01
+
+        for ch, prob in self.unigram_dist.items():
+            scores[ch] = scores.get(ch, 0.0) + unigram_weight * prob
+
+        top3 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
+        top3 = [ch for ch, _ in top3]
+
+        # pad if needed
+        for d in self.default_top3:
+            if len(top3) >= 3:
+                break
+            if d not in top3:
+                top3.append(d)
+
+        return "".join(top3[:3])
 
     def save(self, work_dir: str) -> None:
         os.makedirs(work_dir, exist_ok=True)
-        payload = {
-            "top3_uni": self.top3_uni,
-            "top3_bi": self.top3_bi,
-            "top3_tri": self.top3_tri,
-            "default_top3": self.default_top3,
-        }
-        path = os.path.join(work_dir, MODEL_FNAME)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
 
+        path = os.path.join(work_dir, MODEL_FNAME)
+
+        payload = {
+            "maps": self.maps,
+            "default_top3": self.default_top3,
+            "unigram_dist": self.unigram_dist,
+        }
+
+        with open(path, "wb") as f:   ### CHANGE: binary mode
+            pickle.dump(payload, f, protocol=4)
+
+        print(f"saved to {path}")
+            
     @classmethod
     def load(cls, work_dir: str):
-        model = MyModel()
+        model = cls()
         path = os.path.join(work_dir, MODEL_FNAME)
 
-        # If no saved model yet, return defaults (won't crash graders)
         if not os.path.isfile(path):
-            model.top3_uni = model.default_top3[:]
+            print(f"erm no model found at {path}; using defaults")
             return model
 
-        with open(path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
 
-        model.default_top3 = payload.get("default_top3") or model.default_top3
-        model.top3_uni = payload.get("top3_uni") or model.default_top3
-        model.top3_bi = payload.get("top3_bi") or {}
-        model.top3_tri = payload.get("top3_tri") or {}
+        model.maps = payload["maps"]
+        model.default_top3 = payload.get("default_top3", model.default_top3)
+        model.unigram_dist = payload.get("unigram_dist", {})
+
+        print(f"loaded from {path}")
         return model
 
 
