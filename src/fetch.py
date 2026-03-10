@@ -22,6 +22,7 @@ OUT_FILE = OUT_DIR / "train.txt"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_CHARS_PER_SOURCE = 5_000_000   # 5 MB per source — keeps model size sane
+LANG_MAX_CHARS = 1_500_000 
 
 def write_chunk(fout, texts, source_name, max_chars=MAX_CHARS_PER_SOURCE):
     written = 0
@@ -88,6 +89,10 @@ with open(OUT_FILE, "w", encoding="utf-8") as fout:
         ("ja", "Japanese"),
         ("zh", "Chinese"),
         ("ar", "Arabic"),
+        ("ko", "Korean"),      
+        ("hi", "Hindi"),       
+        ("tr", "Turkish"),
+        ("pl", "Polish"),
     ]
     print("\n[3/3] Multilingual (opus_books) …")
     for lang_code, lang_name in LANGUAGES:
@@ -108,6 +113,33 @@ with open(OUT_FILE, "w", encoding="utf-8") as fout:
             write_chunk(fout, texts, f"opus_books/{lang_name}", max_chars=1_000_000)
         except Exception as e:
             print(f"  opus_books/{lang_name} failed: {e} (skipping)")
+
+
+    # ── 4. ← NEW: CC-100 multilingual web crawl (broader language coverage) ──
+    CC100_LANGS = ["fr", "de", "es", "ar", "zh-Hans", "ru", "ja", "ko", "hi", "pl"]
+    print("\n[4/4] CC-100 multilingual web crawl …")   # ← NEW block
+    for lang_code in CC100_LANGS:
+        try:
+            ds = load_dataset(
+                "cc100",
+                lang=lang_code,
+                split="train",
+                trust_remote_code=True,
+                streaming=True,
+            )
+            written = 0
+            for row in ds:
+                t = row.get("text", "").strip()
+                if not t:
+                    continue
+                fout.write(t + "\n")
+                written += len(t) + 1
+                if written >= 500_000:   # 0.5 MB per language from CC-100
+                    break
+            print(f"  [cc100/{lang_code}] wrote ~{written/1e6:.2f} MB")
+        except Exception as e:
+            print(f"  cc100/{lang_code} failed: {e} (skipping)")
+
 
 total = OUT_FILE.stat().st_size
 print(f"\n=== Done. Total: {total/1e6:.1f} MB written to {OUT_FILE} ===")

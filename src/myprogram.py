@@ -9,9 +9,9 @@ from collections import Counter, defaultdict
 # MODEL_FNAME = "model.json"
 MODEL_FNAME = "model.pkl"
 
-MAX_ORDER = 6
-TOP_K     = 25
-WEIGHTS = [0.20, 0.20, 0.18, 0.16, 0.14, 0.12]
+MAX_ORDER = 4
+TOP_K     = 3
+WEIGHTS = [0.10, 0.20, 0.35, 0.35]
 def _safe_read_text(path: str) -> str:
     """Read UTF-8 text robustly (ignore decode errors)."""
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -70,9 +70,9 @@ class MyModel:
     """
 
     def __init__(self):
-        self.maps: list = [{} for _ in range(MAX_ORDER)]
         self.default_top3: list = [" ", "e", "t"]
-        self.unigram_dist: dict = {}
+        self.unigram_top3: dict = [" ", "e", "t"]
+        self.lookup: dict[str, str] = {}
 
 
     @classmethod
@@ -116,12 +116,8 @@ class MyModel:
             return
         
         unigram_counter = Counter(text)
-        total_chars = sum(unigram_counter.values())
-        self.unigram_dist = {
-            c: cnt / total_chars
-            for c, cnt in unigram_counter.items()
-        }
         self.default_top3 = [c for c, _ in unigram_counter.most_common(3)]
+        self.unigram_top3 = self.default_top3[:]
 
         print(f"Training on {len(text):,} characters, max order={MAX_ORDER}")
 
@@ -144,20 +140,20 @@ class MyModel:
                 ctx = text[start : i + 1]
                 counters[order][ctx][nxt] += 1
 
-        # store top-K instead of top-3
-        for order in range(MAX_ORDER):
-            self.maps[order] = {}
+        self.lookup = {}
 
+        # Unigram fallback (empty context)
+        uni_top3 = "".join(c for c, _ in counters[0][""].most_common(TOP_K))
+        self.lookup[""] = (uni_top3 + "".join(self.default_top3))[:3]
+
+        for order in range(1, MAX_ORDER):
             for ctx, ctr in counters[order].items():
-                top = ctr.most_common(TOP_K)
-                total = sum(ctr.values())
+                top = "".join(c for c, _ in ctr.most_common(TOP_K))
+                # pad with default if fewer than 3 unique successors seen
+                padded = top + "".join(self.default_top3)
+                self.lookup[ctx] = padded[:3]
 
-                # store normalized probabilities
-                self.maps[order][ctx] = {
-                    c: cnt / total
-                    for c, cnt in top
-                }
-
+        print(f"lookup table: {len(self.lookup):,} entries")
         print("done")
 
 
@@ -178,56 +174,19 @@ class MyModel:
         return preds
     
     def _predict_one(self, inp: str) -> str:
-        scores = {}
-        available = []
-
-        for order in range(MAX_ORDER):
-
-            if order == 0:
-                ctx = ""
-            else:
-                if len(inp) < order:
-                    continue
+        for order in range(MAX_ORDER - 1, 0, -1):
+            if len(inp) >= order:
                 ctx = inp[-order:]
+                result = self.lookup.get(ctx)
+                if result:
+                    return result
 
-            candidates = self.maps[order].get(ctx)
+        # unigram fallback
+        result = self.lookup.get("")
+        if result:
+            return result
 
-            if candidates:
-                available.append((order, candidates))
-
-        if not available:
-            if self.unigram_dist:
-                top3 = sorted(self.unigram_dist.items(),
-                            key=lambda x: x[1],
-                            reverse=True)[:3]
-                return "".join(c for c, _ in top3)
-
-            return "".join(self.default_top3[:3])
-
-        total_weight = sum(WEIGHTS[o] for o, _ in available)
-
-        for order, candidates in available:
-            weight = WEIGHTS[order] / total_weight
-
-            for ch, prob in candidates.items():
-                scores[ch] = scores.get(ch, 0.0) + weight * prob
-
-        unigram_weight = 0.01
-
-        for ch, prob in self.unigram_dist.items():
-            scores[ch] = scores.get(ch, 0.0) + unigram_weight * prob
-
-        top3 = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:3]
-        top3 = [ch for ch, _ in top3]
-
-        # pad if needed
-        for d in self.default_top3:
-            if len(top3) >= 3:
-                break
-            if d not in top3:
-                top3.append(d)
-
-        return "".join(top3[:3])
+        return "".join(self.default_top3[:3])
 
     def save(self, work_dir: str) -> None:
         os.makedirs(work_dir, exist_ok=True)
@@ -235,12 +194,12 @@ class MyModel:
         path = os.path.join(work_dir, MODEL_FNAME)
 
         payload = {
-            "maps": self.maps,
+            "lookup": self.lookup,
             "default_top3": self.default_top3,
-            "unigram_dist": self.unigram_dist,
+            "unigram_top3": self.unigram_top3,
         }
 
-        with open(path, "wb") as f:   ### CHANGE: binary mode
+        with open(path, "wb") as f:   # binary mode
             pickle.dump(payload, f, protocol=4)
 
         print(f"saved to {path}")
@@ -257,9 +216,9 @@ class MyModel:
         with open(path, "rb") as f:
             payload = pickle.load(f)
 
-        model.maps = payload["maps"]
+        model.lookup = payload.get("lookup", {})
         model.default_top3 = payload.get("default_top3", model.default_top3)
-        model.unigram_dist = payload.get("unigram_dist", {})
+        model.unigram_top3 = payload.get("unigram_top3", model.default_top3)
 
         print(f"loaded from {path}")
         return model
